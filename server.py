@@ -382,7 +382,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         connected_clients.pop(client_id, None)
         await refresh_contacts_for_peers(client_id)
 
-# Serve static directory & service worker
+# Serve static directory & service worker safely
+os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 APK_PATH = os.path.join(BASE_DIR, "Chats.apk")
@@ -401,15 +402,27 @@ async def download_apk():
 
 @app.get("/manifest.json")
 async def get_manifest():
-    return FileResponse(os.path.join(STATIC_DIR, "manifest.json"), media_type="application/manifest+json")
+    manifest_file = os.path.join(STATIC_DIR, "manifest.json")
+    if os.path.exists(manifest_file):
+        return FileResponse(manifest_file, media_type="application/manifest+json")
+    return {"status": "ok"}
 
 @app.get("/sw.js")
 async def get_sw():
-    return FileResponse(os.path.join(STATIC_DIR, "sw.js"), media_type="application/javascript")
+    sw_file = os.path.join(STATIC_DIR, "sw.js")
+    if os.path.exists(sw_file):
+        return FileResponse(sw_file, media_type="application/javascript")
+    return {"status": "ok"}
 
 @app.get("/")
 async def get_index():
-    return FileResponse(INDEX_PATH)
+    if os.path.exists(INDEX_PATH):
+        return FileResponse(INDEX_PATH)
+    return {
+        "status": "online",
+        "service": "Chats Mobile Cloud Server",
+        "websocket": "/ws/{client_id}"
+    }
 
 if __name__ == "__main__":
     local_ip = get_local_ip()
