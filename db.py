@@ -127,13 +127,63 @@ def get_or_create_user(user_id, username, avatar):
     conn.close()
     return {"id": user_id, "username": username, "invite_code": invite_code, "avatar": avatar}
 
-def get_user_by_code(invite_code):
+def get_user_by_code_or_name(query):
+    if not query:
+        return None
+    q = query.strip()
+    q_clean = q.upper().replace(" ", "").replace("#", "")
     conn = get_connection()
     c = conn.cursor()
-    c.execute("SELECT id, username, invite_code, avatar FROM users WHERE UPPER(invite_code) = UPPER(?)", (invite_code.strip(),))
+
+    # 1. Exact invite code match
+    c.execute("SELECT id, username, invite_code, avatar FROM users WHERE UPPER(invite_code) = ?", (q_clean,))
     row = c.fetchone()
+
+    # 2. Match without or with 'CH-' prefix
+    if not row and not q_clean.startswith("CH-"):
+        c.execute("SELECT id, username, invite_code, avatar FROM users WHERE UPPER(invite_code) = ?", (f"CH-{q_clean}",))
+        row = c.fetchone()
+    if not row and q_clean.startswith("CH-"):
+        without_prefix = q_clean[3:]
+        c.execute("SELECT id, username, invite_code, avatar FROM users WHERE UPPER(invite_code) = ?", (without_prefix,))
+        row = c.fetchone()
+
+    # 3. Exact username match
+    if not row:
+        c.execute("SELECT id, username, invite_code, avatar FROM users WHERE UPPER(username) = UPPER(?)", (q,))
+        row = c.fetchone()
+
+    # 4. Partial username match
+    if not row:
+        c.execute("SELECT id, username, invite_code, avatar FROM users WHERE UPPER(username) LIKE UPPER(?)", (f"%{q}%",))
+        row = c.fetchone()
+
     conn.close()
     return dict(row) if row else None
+
+def get_user_by_code(invite_code):
+    return get_user_by_code_or_name(invite_code)
+
+def add_mutual_contacts(user_a, user_b):
+    if user_a == user_b:
+        return
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO contacts (user_id, contact_id) VALUES (?, ?)", (user_a, user_b))
+    c.execute("INSERT OR IGNORE INTO contacts (user_id, contact_id) VALUES (?, ?)", (user_b, user_a))
+    # Also resolve any invitations between them
+    c.execute("UPDATE invitations SET status = 'accepted' WHERE (from_id = ? AND to_id = ?) OR (from_id = ? AND to_id = ?)",
+              (user_a, user_b, user_b, user_a))
+    conn.commit()
+    conn.close()
+
+def resolve_pending_invitations(user_a, user_b):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("UPDATE invitations SET status = 'accepted' WHERE (from_id = ? AND to_id = ?) OR (from_id = ? AND to_id = ?)",
+              (user_a, user_b, user_b, user_a))
+    conn.commit()
+    conn.close()
 
 def get_user_by_id(user_id):
     conn = get_connection()
@@ -176,26 +226,33 @@ def create_invitation(from_id, to_id):
         return {"error": "Cannot invite yourself"}
     conn = get_connection()
     c = conn.cursor()
-
-    # Check if already contacts
     c.execute("SELECT 1 FROM contacts WHERE user_id = ? AND contact_id = ?", (from_id, to_id))
     if c.fetchone():
         conn.close()
         return {"error": "Already in your contacts list"}
 
-    # Check if already pending invitation
-    c.execute("SELECT 1 FROM invitations WHERE from_id = ? AND to_id = ? AND status = 'pending'", (from_id, to_id))
+    # Reciprocal pending invitations mean both people have requested a connection.
+    c.execute("SELECT id FROM invitations WHERE from_id = ? AND to_id = ? AND status = 'pending'", (to_id, from_id))
+    reverse_invite = c.fetchone()
+    if reverse_invite:
+        c.execute("UPDATE invitations SET status = 'accepted' WHERE (from_id = ? AND to_id = ?) OR (from_id = ? AND to_id = ?)",
+                  (from_id, to_id, to_id, from_id))
+        c.execute("INSERT OR IGNORE INTO contacts (user_id, contact_id) VALUES (?, ?)", (from_id, to_id))
+        c.execute("INSERT OR IGNORE INTO contacts (user_id, contact_id) VALUES (?, ?)", (to_id, from_id))
+        conn.commit()
+        conn.close()
+        return {"success": True, "connected": True, "invitation_id": reverse_invite["id"]}
+
+    c.execute("SELECT id FROM invitations WHERE from_id = ? AND to_id = ? AND status = 'pending'", (from_id, to_id))
     if c.fetchone():
         conn.close()
         return {"error": "Invitation already sent and pending"}
 
-    inv_id = f"inv_{random.randint(100000, 999999)}"
-    c.execute("INSERT INTO invitations (id, from_id, to_id, status) VALUES (?, ?, ?, 'pending')",
-              (inv_id, from_id, to_id))
+    inv_id = f"inv_{os.urandom(8).hex()}"
+    c.execute("INSERT INTO invitations (id, from_id, to_id, status) VALUES (?, ?, ?, 'pending')", (inv_id, from_id, to_id))
     conn.commit()
     conn.close()
-    return {"success": True, "invitation_id": inv_id}
-
+    return {"success": True, "connected": False, "invitation_id": inv_id}
 def accept_invitation(invitation_id, user_id):
     conn = get_connection()
     c = conn.cursor()

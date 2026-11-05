@@ -148,79 +148,78 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         "avatar": new_avatar
                     }))
 
-            elif msg_type == "send_invitation":
-                # Invite by code
+            elif msg_type in ("send_invitation", "add_contact"):
                 target_code = data.get("targetCode", "").strip()
-                target_user = db.get_user_by_code(target_code)
-
+                target_user = db.get_user_by_code_or_name(target_code)
                 if not target_user:
-                    await websocket.send_text(json.dumps({
-                        "type": "invite_result",
-                        "success": False,
-                        "message": f"No user found with Chat ID: {target_code}"
-                    }))
+                    await websocket.send_text(json.dumps({"type": "invite_result", "success": False, "message": f"No user found matching: '{target_code}'"}))
                 elif target_user["id"] == client_id:
-                    await websocket.send_text(json.dumps({
-                        "type": "invite_result",
-                        "success": False,
-                        "message": "You cannot invite yourself!"
-                    }))
+                    await websocket.send_text(json.dumps({"type": "invite_result", "success": False, "message": "You cannot add yourself!"}))
                 else:
-                    res = db.create_invitation(client_id, target_user["id"])
-                    if "error" in res:
+                    target_id = target_user["id"]
+                    result = db.create_invitation(client_id, target_id)
+                    if result.get("error"):
+                        await websocket.send_text(json.dumps({"type": "invite_result", "success": False, "message": result["error"]}))
+                    elif result.get("connected"):
+                        await refresh_user_contacts(client_id)
+                        await refresh_user_contacts(target_id)
+                        sender = db.get_user_by_id(client_id) or {}
                         await websocket.send_text(json.dumps({
-                            "type": "invite_result",
-                            "success": False,
-                            "message": res["error"]
+                            "type": "invite_result", "success": True,
+                            "message": f"Connected with {target_user['username']}!",
+                            "contact": {"id": target_id, "username": target_user["username"],
+                                        "invite_code": target_user.get("invite_code", ""),
+                                        "avatar": target_user.get("avatar", "1"),
+                                        "is_online": target_id in connected_clients,
+                                        "in_call": connected_clients.get(target_id, {}).get("in_call", False)}
+                        }))
+                        await notify_user(target_id, {"type": "invitation_accepted", "byName": sender.get("username", "Someone"), "byId": client_id})
+                        await websocket.send_text(json.dumps({
+                            "type": "pending_invites_update",
+                            "invites": db.get_pending_invitations_for(client_id)
                         }))
                     else:
-                        sender_name = connected_clients.get(client_id, {}).get("username", "Someone")
-                        sender_avatar = connected_clients.get(client_id, {}).get("avatar", "1")
-                        sender_code = connected_clients.get(client_id, {}).get("invite_code", "")
-
-                        await websocket.send_text(json.dumps({
-                            "type": "invite_result",
-                            "success": True,
-                            "message": f"Invitation sent to {target_user['username']}! Waiting for acceptance."
-                        }))
-
-                        # Real-time alert to recipient if online
-                        await notify_user(target_user["id"], {
-                            "type": "new_invitation",
-                            "invitationId": res["invitation_id"],
-                            "fromId": client_id,
-                            "fromName": sender_name,
-                            "fromCode": sender_code,
-                            "fromAvatar": sender_avatar
+                        sender = db.get_user_by_id(client_id) or {}
+                        await websocket.send_text(json.dumps({"type": "invite_result", "success": True, "message": f"Invitation sent to {target_user['username']}."}))
+                        await notify_user(target_id, {
+                            "type": "new_invitation", "invitationId": result["invitation_id"],
+                            "fromId": client_id, "fromName": sender.get("username", "Someone"),
+                            "fromCode": sender.get("invite_code", ""), "fromAvatar": sender.get("avatar", "1")
                         })
-
-            elif msg_type == "accept_invitation":
+            elif msg_type in ("accept_invitation", "respond_invitation"):
+                action = data.get("action", "accept")
                 invitation_id = data.get("invitationId")
-                res = db.accept_invitation(invitation_id, client_id)
-                if res.get("success"):
-                    other_user_id = res["contact_id"]
-                    my_name = connected_clients.get(client_id, {}).get("username", "Your contact")
 
-                    # Refresh contacts on both sides
-                    await refresh_user_contacts(client_id)
-                    await refresh_user_contacts(other_user_id)
-
-                    # Notify sender that invite was accepted
-                    await notify_user(other_user_id, {
-                        "type": "invitation_accepted",
-                        "byName": my_name,
-                        "byId": client_id
-                    })
-
-                    # Send updated pending list to acceptor
+                if action == "reject":
+                    db.reject_invitation(invitation_id, client_id)
                     pending_invites = db.get_pending_invitations_for(client_id)
                     await websocket.send_text(json.dumps({
                         "type": "pending_invites_update",
                         "invites": pending_invites
                     }))
+                else:
+                    res = db.accept_invitation(invitation_id, client_id)
+                    if res.get("success"):
+                        other_user_id = res["contact_id"]
+                        my_name = connected_clients.get(client_id, {}).get("username", "Your contact")
 
-            elif msg_type == "ping":
-                await websocket.send_text(json.dumps({"type": "pong"}))
+                        # Refresh contacts on both sides
+                        await refresh_user_contacts(client_id)
+                        await refresh_user_contacts(other_user_id)
+
+                        # Notify sender that invite was accepted
+                        await notify_user(other_user_id, {
+                            "type": "invitation_accepted",
+                            "byName": my_name,
+                            "byId": client_id
+                        })
+
+                        # Send updated pending list to acceptor
+                        pending_invites = db.get_pending_invitations_for(client_id)
+                        await websocket.send_text(json.dumps({
+                            "type": "pending_invites_update",
+                            "invites": pending_invites
+                        }))
 
             elif msg_type == "reject_invitation":
                 invitation_id = data.get("invitationId")
