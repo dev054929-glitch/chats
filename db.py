@@ -54,9 +54,14 @@ def init_db():
         recipient_id TEXT NOT NULL,
         text TEXT NOT NULL,
         time TEXT NOT NULL,
+        status TEXT DEFAULT 'sent',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
+    try:
+        c.execute("ALTER TABLE messages ADD COLUMN status TEXT DEFAULT 'sent'")
+    except Exception:
+        pass
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS call_logs (
@@ -222,19 +227,45 @@ def reject_invitation(invitation_id, user_id):
     conn.close()
     return {"success": True}
 
-def save_message(msg_id, sender_id, recipient_id, text, time_str):
+def save_message(msg_id, sender_id, recipient_id, text, time_str, status='sent'):
     conn = get_connection()
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO messages (id, sender_id, recipient_id, text, time) VALUES (?, ?, ?, ?, ?)",
-              (msg_id, sender_id, recipient_id, text, time_str))
+    c.execute("INSERT OR REPLACE INTO messages (id, sender_id, recipient_id, text, time, status) VALUES (?, ?, ?, ?, ?, ?)",
+              (msg_id, sender_id, recipient_id, text, time_str, status))
     conn.commit()
     conn.close()
+
+def update_message_status(msg_id, status):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("UPDATE messages SET status = ? WHERE id = ?", (status, msg_id))
+    conn.commit()
+    conn.close()
+
+def mark_messages_read(user_id, contact_id):
+    """Mark all messages sent by contact_id to user_id as read"""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("""
+        SELECT id FROM messages 
+        WHERE recipient_id = ? AND sender_id = ? AND status != 'read'
+    """, (user_id, contact_id))
+    rows = c.fetchall()
+    updated_ids = [r["id"] for r in rows]
+    if updated_ids:
+        c.execute("""
+            UPDATE messages SET status = 'read'
+            WHERE recipient_id = ? AND sender_id = ?
+        """, (user_id, contact_id))
+        conn.commit()
+    conn.close()
+    return updated_ids
 
 def get_chat_history(user_a, user_b, limit=50):
     conn = get_connection()
     c = conn.cursor()
     c.execute("""
-        SELECT id, sender_id, recipient_id, text, time
+        SELECT id, sender_id, recipient_id, text, time, status
         FROM messages
         WHERE (sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?)
         ORDER BY created_at ASC

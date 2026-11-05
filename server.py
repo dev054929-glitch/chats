@@ -246,8 +246,11 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 time_str = data.get("time", "")
                 msg_id = data.get("id") or f"msg_{os.urandom(6).hex()}"
 
-                # Save to database
-                db.save_message(msg_id, client_id, target_id, text, time_str)
+                is_recipient_online = target_id in connected_clients
+                initial_status = "delivered" if is_recipient_online else "sent"
+
+                # Save to database with status
+                db.save_message(msg_id, client_id, target_id, text, time_str, initial_status)
 
                 sender_name = connected_clients.get(client_id, {}).get("username", "Unknown")
                 sender_avatar = connected_clients.get(client_id, {}).get("avatar", "1")
@@ -260,7 +263,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     "senderAvatar": sender_avatar,
                     "targetId": target_id,
                     "text": text,
-                    "time": time_str
+                    "time": time_str,
+                    "status": initial_status
                 }
 
                 # Forward to recipient
@@ -269,7 +273,19 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 # Return receipt to sender
                 out_payload["isSender"] = True
                 out_payload["delivered"] = delivered
+                out_payload["status"] = "delivered" if delivered else "sent"
                 await websocket.send_text(json.dumps(out_payload))
+
+            elif msg_type == "mark_read":
+                contact_id = data.get("contactId")
+                if contact_id:
+                    updated_ids = db.mark_messages_read(client_id, contact_id)
+                    if updated_ids:
+                        await notify_user(contact_id, {
+                            "type": "messages_read",
+                            "byUserId": client_id,
+                            "messageIds": updated_ids
+                        })
 
             elif msg_type == "typing":
                 target_id = data.get("targetId")
@@ -291,12 +307,14 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 if target_id in connected_clients:
                     callee = connected_clients[target_id]
                     if callee.get("in_call"):
+                        connected_clients[client_id]["in_call"] = False
                         await websocket.send_text(json.dumps({
                             "type": "call_busy",
                             "reason": f"{callee.get('username')} is on another call."
                         }))
                     else:
                         connected_clients[client_id]["in_call"] = True
+                        connected_clients[target_id]["in_call"] = True
                         await notify_user(target_id, {
                             "type": "call_offer",
                             "callerId": client_id,
@@ -305,6 +323,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             "sdp": data.get("sdp")
                         })
                 else:
+                    connected_clients[client_id]["in_call"] = False
                     # Save missed call in DB
                     db.save_call_log(
                         f"call_{os.urandom(4).hex()}",
@@ -315,10 +334,25 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         "message": "User is currently offline."
                     }))
 
+            elif msg_type == "call_cancel":
+                target_id = data.get("targetId")
+                if client_id in connected_clients:
+                    connected_clients[client_id]["in_call"] = False
+                if target_id in connected_clients:
+                    connected_clients[target_id]["in_call"] = False
+                await notify_user(target_id, {
+                    "type": "call_cancel",
+                    "callerId": client_id
+                })
+                await refresh_contacts_for_peers(client_id)
+                await refresh_contacts_for_peers(target_id)
+
             elif msg_type == "call_answer":
                 target_id = data.get("targetId")
                 if client_id in connected_clients:
                     connected_clients[client_id]["in_call"] = True
+                if target_id in connected_clients:
+                    connected_clients[target_id]["in_call"] = True
                 await notify_user(target_id, {
                     "type": "call_answer",
                     "responderId": client_id,
